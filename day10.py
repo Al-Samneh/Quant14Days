@@ -1,5 +1,5 @@
 """
-Day 10:SPX European Option Pricing and Greeks Analysis
+Day 10: Professional SPX European Option Pricing and Greeks Analysis
 
 This retrieves near-term European call option data for the S&P 500 Index (^SPX)
 using the yfinance library. It then calculates the theoretical price and Greeks 
@@ -10,9 +10,11 @@ using the yfinance library. It then calculates the theoretical price and Greeks
 The reason we utilize the European option is because we can use the Black-Scholes
 formula to price it, which is more accurate than the American option.
 
-The script identifies potentially underpriced options by comparing the calculated
-Black-Scholes price to the market's bid-ask midpoint, flagging those trading
-below a specified threshold.
+PROFESSIONAL TRADING LOGIC:
+- Uses ASK prices (not midpoint) for buy decisions to reflect executable costs
+- Filters for liquid options only (volume > 50, open interest > 100)
+- Requires tight bid-ask spreads (<10% of ask) for reliable execution
+- Compares executable ask price directly to theoretical Black-Scholes value
 """
 
 import numpy as np
@@ -223,22 +225,17 @@ def analyze_option(call_data: pd.Series, S0: float, expiry: pd.Timestamp, today:
     K = call_data['strike']
     sigma = call_data['impliedVolatility']
     
-    # Calculate market price with better handling of missing data
+    # Use the actual executable price (ask) for buy decisions
     bid = call_data.get('bid', 0)
     ask = call_data.get('ask', 0)
-    last_price = call_data.get('lastPrice', 0)
     
-    # Use bid-ask midpoint if both available, otherwise use last price
-    if bid > 0 and ask > 0:
-        market_price = (bid + ask) / 2
-    elif last_price > 0:
-        market_price = last_price
-    else:
-        return None  # Skip if no valid price data
-    
-    # Skip options with unreasonably wide spreads (>50% of mid)
-    if bid > 0 and ask > 0 and (ask - bid) / market_price > 0.5:
+    # Must have valid bid and ask prices (already filtered in main, but double-check)
+    if bid <= 0 or ask <= 0:
         return None
+    
+    # Use ask price as the executable market price for buying
+    market_price = ask
+    midpoint_price = (bid + ask) / 2  # Keep for comparison/display
     
     T_days = (expiry - today).days
     T_years = max(days_to_years(T_days), MIN_TIME_TO_EXPIRY)
@@ -247,16 +244,18 @@ def analyze_option(call_data: pd.Series, S0: float, expiry: pd.Timestamp, today:
         bs = bs_price_and_greeks(S0, K, T_years, RISK_FREE_RATE, sigma)
         mc = monte_carlo_price_and_greeks(S0, K, T_years, RISK_FREE_RATE, sigma)
         
-        # Decision Logic
-        price_diff = (market_price - bs['Price']) / bs['Price']
-        if price_diff < UNDERPRICING_THRESHOLD:
-            decision = f"BUY (Market is {abs(price_diff):.1%} below theoretical)"
+        # Professional Decision Logic: Compare executable ask price to theoretical value
+        if ask < bs['Price']:
+            price_diff = (ask - bs['Price']) / bs['Price']
+            decision = f"BUY (Ask ${ask:.2f} is {abs(price_diff):.1%} below theoretical ${bs['Price']:.2f})"
         else:
-            decision = "HOLD (Fairly priced or overpriced)"
+            decision = f"HOLD (Ask ${ask:.2f} >= theoretical ${bs['Price']:.2f})"
         
         return {
             'strike': K,
-            'market_price': market_price,
+            'ask_price': ask,
+            'bid_price': bid,
+            'midpoint_price': midpoint_price,
             'implied_vol': sigma,
             'bs_results': bs,
             'mc_results': mc,
@@ -269,12 +268,12 @@ def analyze_option(call_data: pd.Series, S0: float, expiry: pd.Timestamp, today:
 
 def print_option_analysis(result: Dict):
     """Print formatted analysis results for a single option."""
-    print(f"\n--- Strike: {result['strike']: <8} | Market Price: {result['market_price']:<6.2f} | IV: {result['implied_vol']:.3f} ---")
+    print(f"\n--- Strike: {result['strike']: <8} | Bid: ${result['bid_price']:<5.2f} | Ask: ${result['ask_price']:<5.2f} | Mid: ${result['midpoint_price']:<5.2f} | IV: {result['implied_vol']:.3f} ---")
     print(f"{'Metric':<10} | {'Black-Scholes':<15} | {'Monte Carlo':<15}")
-    print("-" * 50)
+    print("-" * 55)
     for key in result['bs_results']:
         print(f"{key:<10} | {result['bs_results'][key]:<15.4f} | {result['mc_results'][key]:<15.4f}")
-    print("-" * 50)
+    print("-" * 55)
     print(f"Decision: {result['decision']}")
 
 
@@ -316,15 +315,23 @@ def main():
             print(f"Could not retrieve option chain for {expiry_str}: {e}")
             continue
 
-        # Filter for relevant options: non-zero volume and implied volatility
+        # Filter for liquid options with professional criteria
         valid_calls = calls[
-            (calls['impliedVolatility'] > 0.001) & (calls['volume'] > 0)
+            (calls['impliedVolatility'] > 0.001) &     # Minimum IV
+            (calls['volume'] > 50) &                   # Minimum daily volume for liquidity
+            (calls['openInterest'] > 100) &            # Minimum open interest for liquidity
+            (calls['ask'] > 0) &                       # Must have valid ask price
+            (calls['bid'] > 0) &                       # Must have valid bid price
+            # Spread must be less than 10% of ask price for reasonable execution
+            ((calls['ask'] - calls['bid']) / calls['ask'] < 0.10)
         ].copy()
 
         if valid_calls.empty:
+            print(f"No liquid options found for {expiry_str} (after professional filters)")
             continue
             
         print(f"===================== Expiry: {expiry_str} =====================")
+        print(f"Found {len(valid_calls)} liquid options (from {len(calls)} total options)")
 
         analyzed_count = 0
         buy_signals = 0
