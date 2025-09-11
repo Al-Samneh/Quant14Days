@@ -19,7 +19,9 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import norm
-from typing import Dict, List
+from typing import Dict, List, Optional
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # Monte Carlo Simulation Parameters
 MONTE_CARLO_SIMULATIONS = 100_000 # Number of paths for the simulation
@@ -43,11 +45,25 @@ EXPIRY_LOOKAHEAD_DAYS = 7         # How many days into the future to scan for ex
 
 np.random.seed(42) # For reproducible Monte Carlo results
 
+# Pre-generate random numbers for efficiency
+_PRECOMPUTED_RANDOMS = None
+
+def get_random_numbers(num_simulations: int) -> np.ndarray:
+    """Get pre-computed random numbers for Monte Carlo simulation."""
+    global _PRECOMPUTED_RANDOMS
+    if _PRECOMPUTED_RANDOMS is None or len(_PRECOMPUTED_RANDOMS) < num_simulations:
+        _PRECOMPUTED_RANDOMS = np.random.randn(max(num_simulations, MONTE_CARLO_SIMULATIONS))
+    return _PRECOMPUTED_RANDOMS[:num_simulations]
+
 
 def days_to_years(days: float) -> float:
     """Converts a number of days to a fraction of a year.
-    Since the formulas need the time in years"""
-    return days / 365.0 # Unsure of divide by 365 or 252, but i think 365 is correct
+    
+    Uses 365 days (calendar time) which is standard for option pricing.
+    Note: 252 is used for business days in volatility calculations, but
+    Black-Scholes uses calendar time for time to expiry.
+    """
+    return days / 365.0
 
 
 def bs_price_and_greeks(
@@ -62,11 +78,17 @@ def bs_price_and_greeks(
         K: Strike price of the option.
         T: Time to expiry in years.
         r: Risk-free interest rate (annualized).
-        Sigma: Implied volatility of the underlying asset (annualized).
+        sigma: Implied volatility of the underlying asset (annualized).
 
     Returns:
         A dictionary containing the calculated Price and Greeks.
     """
+    # Input validation
+    if S0 <= 0 or K <= 0 or sigma <= 0:
+        raise ValueError("S0, K, and sigma must be positive")
+    if T < 0:
+        raise ValueError("Time to expiry cannot be negative")
+    
     out = {g: 0.0 for g in ['Price', 'Delta', 'Gamma', 'Vega', 'Theta', 'Rho']}
     
     if T < MIN_TIME_TO_EXPIRY:
@@ -141,7 +163,7 @@ def monte_carlo_price_and_greeks(
 
     # 1. Generate a single set of random numbers for all calculations
     # This is the core of the "common random numbers" variance reduction technique.
-    Z = np.random.randn(num_simulations)
+    Z = get_random_numbers(num_simulations)
 
     # 2. Define a reusable pricing function
     def price_path(spot, time, rate, vol):
@@ -166,13 +188,13 @@ def monte_carlo_price_and_greeks(
     V_minus_dt = price_path(S0, T - dt, r, sigma)
     
     # For Rho
-    V_plus_dr = price_path(S0, T, r + dr, sigma + dr)
+    V_plus_dr = price_path(S0, T, r + dr, sigma) # I had initially bumped the risk-free rate and the volatility, but it was not necessary
 
     # 4. Calculate Greeks using finite differences
     delta = (V_plus_h - V_minus_h) / (2 * h)
     gamma = (V_plus_h - 2 * V0 + V_minus_h) / (h**2)
     vega = (V_plus_dv - V0) / dv # Vega per 100% change, multiply by 0.01 for 1%
-    theta = (V_minus_dt - V0) / -dt # Theta per year, divide by 365 for daily
+    theta = (V_minus_dt - V0) / dt # Theta per year, divide by 365 for daily
     rho = (V_plus_dr - V0) / dr # Rho per 100% change, multiply by 0.01 for 1%
 
     out.update({
@@ -184,6 +206,77 @@ def monte_carlo_price_and_greeks(
         'Rho': rho * 0.01
     })
     return out
+
+def analyze_option(call_data: pd.Series, S0: float, expiry: pd.Timestamp, today: pd.Timestamp) -> Optional[Dict]:
+    """
+    Analyze a single option and return pricing results.
+    
+    Args:
+        call_data: Series containing option data (strike, IV, bid, ask, etc.)
+        S0: Current spot price
+        expiry: Option expiry date
+        today: Current date
+        
+    Returns:
+        Dictionary with analysis results or None if option should be skipped
+    """
+    K = call_data['strike']
+    sigma = call_data['impliedVolatility']
+    
+    # Calculate market price with better handling of missing data
+    bid = call_data.get('bid', 0)
+    ask = call_data.get('ask', 0)
+    last_price = call_data.get('lastPrice', 0)
+    
+    # Use bid-ask midpoint if both available, otherwise use last price
+    if bid > 0 and ask > 0:
+        market_price = (bid + ask) / 2
+    elif last_price > 0:
+        market_price = last_price
+    else:
+        return None  # Skip if no valid price data
+    
+    # Skip options with unreasonably wide spreads (>50% of mid)
+    if bid > 0 and ask > 0 and (ask - bid) / market_price > 0.5:
+        return None
+    
+    T_days = (expiry - today).days
+    T_years = max(days_to_years(T_days), MIN_TIME_TO_EXPIRY)
+    
+    try:
+        bs = bs_price_and_greeks(S0, K, T_years, RISK_FREE_RATE, sigma)
+        mc = monte_carlo_price_and_greeks(S0, K, T_years, RISK_FREE_RATE, sigma)
+        
+        # Decision Logic
+        price_diff = (market_price - bs['Price']) / bs['Price']
+        if price_diff < UNDERPRICING_THRESHOLD:
+            decision = f"BUY (Market is {abs(price_diff):.1%} below theoretical)"
+        else:
+            decision = "HOLD (Fairly priced or overpriced)"
+        
+        return {
+            'strike': K,
+            'market_price': market_price,
+            'implied_vol': sigma,
+            'bs_results': bs,
+            'mc_results': mc,
+            'decision': decision
+        }
+    except (ValueError, ZeroDivisionError) as e:
+        print(f"Error analyzing option with strike {K}: {e}")
+        return None
+
+
+def print_option_analysis(result: Dict):
+    """Print formatted analysis results for a single option."""
+    print(f"\n--- Strike: {result['strike']: <8} | Market Price: {result['market_price']:<6.2f} | IV: {result['implied_vol']:.3f} ---")
+    print(f"{'Metric':<10} | {'Black-Scholes':<15} | {'Monte Carlo':<15}")
+    print("-" * 50)
+    for key in result['bs_results']:
+        print(f"{key:<10} | {result['bs_results'][key]:<15.4f} | {result['mc_results'][key]:<15.4f}")
+    print("-" * 50)
+    print(f"Decision: {result['decision']}")
+
 
 # --------------------------------------------------------------------------
 def main():
@@ -233,37 +326,18 @@ def main():
             
         print(f"===================== Expiry: {expiry_str} =====================")
 
+        analyzed_count = 0
+        buy_signals = 0
+        
         for _, call in valid_calls.iterrows():
-            K = call['strike']
-            sigma = call['impliedVolatility']
-            # Use bid-ask midpoint as a proxy for market price. but to be honest really
-            # not the best way to do it, it could be refined (e.g., using last trade price or liquidity-weighted).
-            market_price = np.mean([call.get('bid', 0), call.get('ask', 0)])
-            
-            # Avoid pricing options with no valid bid/ask
-            if market_price == 0:
-                continue
-
-            T_days = (expiry - today).days
-            T_years = max(days_to_years(T_days), MIN_TIME_TO_EXPIRY)
-
-            bs = bs_price_and_greeks(S0, K, T_years, RISK_FREE_RATE, sigma)
-            mc = monte_carlo_price_and_greeks(S0, K, T_years, RISK_FREE_RATE, sigma)
-
-            # Decision Logic
-            price_diff = (market_price - bs['Price']) / bs['Price']
-            if price_diff < UNDERPRICING_THRESHOLD:
-                decision = f"BUY (Market is {abs(price_diff):.1%} below theoretical)"
-            else:
-                decision = "HOLD (Fairly priced or overpriced)"
-
-            print(f"\n--- Strike: {K: <8} | Market Price: {market_price:<6.2f} | IV: {sigma:.3f} ---")
-            print(f"{'Metric':<10} | {'Black-Scholes':<15} | {'Monte Carlo':<15}")
-            print("-" * 50)
-            for key in bs:
-                print(f"{key:<10} | {bs[key]:<15.4f} | {mc[key]:<15.4f}")
-            print("-" * 50)
-            print(f"Decision: {decision}")
+            result = analyze_option(call, S0, expiry, today)
+            if result:
+                print_option_analysis(result)
+                analyzed_count += 1
+                if "BUY" in result['decision']:
+                    buy_signals += 1
+        
+        print(f"\nSummary for {expiry_str}: Analyzed {analyzed_count} options, {buy_signals} BUY signals")
 
 
 if __name__ == "__main__":
