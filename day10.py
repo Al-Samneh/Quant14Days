@@ -341,10 +341,8 @@ def main():
             if result:
                 print_option_analysis(result)
                 analyzed_count += 1
-                if "BUY" in result['decision']:
-                    buy_signals += 1
-        
-        print(f"\nSummary for {expiry_str}: Analyzed {analyzed_count} options, {buy_signals} BUY signals")
+                
+        print(f"\nSummary for {expiry_str}: Analyzed {analyzed_count} options")
 
 
 if __name__ == "__main__":
